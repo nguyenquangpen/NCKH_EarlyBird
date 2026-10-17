@@ -5,9 +5,71 @@ import utils.geom
 import utils.vox
 import utils.basic
 
+from kornia.filters import gaussian_blur2d
 from kornia.geometry.transform.imgwarp import warp_perspective
 from models.encoder import Encoder_res101, Encoder_res50, Encoder_res18, Encoder_eff, Encoder_swin_t, Encoder_res34
 from models.decoder import Decoder
+
+VIEW_FUSION_MODES = ('none', 'geo', 'm1')
+
+
+class ViewGatedFusion(nn.Module):
+    """
+    View-aware gated fusion of per-camera BEV features.
+
+    geo: w_s = W_geo_s / sum_s' W_geo_s'                       (no parameters, alpha = 1)
+    m1:  w_s = softmax_s(log W_geo_s + g([F_s, ray_s]) / T)    (g shared over cameras, alpha learnt from 0)
+    Both: gate_s = 1 + alpha * (N * w_s - 1),  F'_s = gate_s * F_s
+    Weights are normalised over the camera dimension and are exactly 0 for cameras that do not see a cell.
+    """
+
+    def __init__(self, feat_dim, mode='m1', hidden_dim=64, blur_kernel=5, blur_sigma=1.5, temperature=1.0):
+        super().__init__()
+        assert mode in ('geo', 'm1')
+        self.mode = mode
+        self.blur_kernel = blur_kernel
+        self.blur_sigma = blur_sigma
+        self.temperature = temperature
+
+        if mode == 'm1':
+            self.g = nn.Sequential(
+                nn.Conv2d(feat_dim + 2, hidden_dim, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_dim, 1, kernel_size=1),
+            )
+            # start from the geometric prior: g == 0 at init
+            nn.init.zeros_(self.g[-1].weight)
+            nn.init.zeros_(self.g[-1].bias)
+            self.alpha = nn.Parameter(torch.zeros(1))
+        else:
+            self.g = None
+            self.register_buffer('alpha', torch.ones(1), persistent=False)
+
+    def forward(self, feats, vis, ray):
+        """
+        feats: (B,S,C,Y,X) per-camera BEV features
+        vis:   (B,S,1,Y,X) bool, camera s sees cell (y,x)
+        ray:   (B,S,2,Y,X) unit vector camera -> cell in mem coordinates
+        returns gated feats (B,S,C,Y,X), N/S (B,1,Y,X), weights w (B,S,1,Y,X)
+        """
+        B, S, C, Y, X = feats.shape
+        vis_f = vis.to(feats.dtype)
+        w_geo = gaussian_blur2d(vis_f.reshape(B * S, 1, Y, X), (self.blur_kernel, self.blur_kernel),
+                                (self.blur_sigma, self.blur_sigma)).reshape(B, S, 1, Y, X)
+        count = vis_f.sum(dim=1, keepdim=True)  # B,1,1,Y,X
+
+        if self.mode == 'geo':
+            w_geo = w_geo * vis_f
+            w = w_geo / w_geo.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        else:
+            g_in = torch.cat([feats, ray.to(feats.dtype)], dim=2).reshape(B * S, C + 2, Y, X)
+            logit = torch.log(w_geo.clamp_min(1e-6)) + self.g(g_in).reshape(B, S, 1, Y, X)
+            logit = (logit / self.temperature).masked_fill(~vis, -1e4)
+            # softmax over cameras (dim=1); cells seen by nobody give a uniform softmax, zeroed by vis
+            w = torch.softmax(logit, dim=1) * vis_f
+
+        gate = 1 + self.alpha * (count * w - 1)
+        return gate * feats, count[:, 0] / S, w
 
 
 class MVDet(nn.Module):
@@ -17,15 +79,19 @@ class MVDet(nn.Module):
                  num_ids=None,
                  latent_dim=512,
                  encoder_type='res18',
+                 view_fusion='none',
                  device=torch.device('cuda')):
         super().__init__()
         assert (encoder_type in ['res101', 'res50', 'res18', 'res34', 'effb0', 'effb4', 'swin_t'])
+        assert view_fusion in VIEW_FUSION_MODES, f'view_fusion must be one of {VIEW_FUSION_MODES}'
+        assert view_fusion == 'none' or num_cameras is not None, 'view_fusion requires num_cameras'
 
         self.Y, self.Z, self.X = Y, Z, X
         self.rand_flip = rand_flip
         self.latent_dim = latent_dim
         self.encoder_type = encoder_type
         self.num_cameras = num_cameras
+        self.view_fusion = view_fusion
 
         self.mean = torch.as_tensor([0.485, 0.456, 0.406], device=device).reshape(1, 3, 1, 1)
         self.std = torch.as_tensor([0.229, 0.224, 0.225], device=device).reshape(1, 3, 1, 1)
@@ -54,8 +120,12 @@ class MVDet(nn.Module):
                 # nn.Conv3d(latent_dim, latent_dim, 3, padding=(1, 2, 2), dilation=(1, 2, 2)),
             )
         else:
+            # geo / m1 append one N/S coverage channel
+            extra_ch = 0 if view_fusion == 'none' else 1
+            if view_fusion != 'none':
+                self.fusion = ViewGatedFusion(self.feat2d_dim, mode=view_fusion)
             self.world_feat = nn.Sequential(
-                nn.Conv2d(self.feat2d_dim * self.num_cameras, latent_dim, kernel_size=3, padding=1),
+                nn.Conv2d(self.feat2d_dim * self.num_cameras + extra_ch, latent_dim, kernel_size=3, padding=1),
                 nn.InstanceNorm3d(latent_dim), nn.ReLU(),
                 nn.Conv2d(latent_dim, latent_dim, kernel_size=1),
             )
@@ -77,6 +147,31 @@ class MVDet(nn.Module):
         self.offset_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
         self.size_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
         self.rot_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
+
+    def view_geometry(self, proj_mats, cams_T_ref_, ref_T_cams_, ref_T_mem, vox_util, Hf, Wf):
+        """
+        Fixed (not learnt) per-camera geometry on the BEV grid.
+        proj_mats: (B*S,3,3) mem_T_featpix, cams_T_ref_ / ref_T_cams_: (B*S,4,4), ref_T_mem: (3,3) ground plane
+        returns vis_ (B*S,1,Y,X) bool, ray_ (B*S,2,Y,X) unit vector camera -> cell centre in mem (x, y)
+        """
+        BS, device, dtype = proj_mats.shape[0], proj_mats.device, proj_mats.dtype
+        ones = torch.ones(BS, 1, Hf, Wf, device=device, dtype=dtype)
+        in_image = warp_perspective(ones, proj_mats, (self.Y, self.X), align_corners=False) > 0.5
+
+        ys, xs = torch.meshgrid(torch.arange(self.Y, device=device, dtype=dtype),
+                                torch.arange(self.X, device=device, dtype=dtype), indexing='ij')
+        grid = torch.stack([xs, ys], 0)  # 2,Y,X  (mem x, mem y) of each cell centre
+
+        # the ground homography also maps cells behind the camera into the image; drop them
+        z_coef = torch.matmul(cams_T_ref_[:, 2:3, [0, 1, 3]], ref_T_mem)[:, 0]  # B*S,3
+        depth = z_coef[:, 0, None, None] * xs + z_coef[:, 1, None, None] * ys + z_coef[:, 2, None, None]
+        vis_ = in_image & (depth > 0).unsqueeze(1)
+
+        mem_T_ref = vox_util.get_mem_T_ref(1, self.Y, self.Z, self.X, device=device)[0].to(dtype)  # 4,4
+        cam_mem = utils.geom.apply_4x4(mem_T_ref.expand(BS, 4, 4), ref_T_cams_[:, None, :3, 3])[:, 0]  # B*S,3
+        ray_ = grid.unsqueeze(0) - cam_mem[:, :2, None, None]  # ground projection of the camera centre
+        ray_ = ray_ / ray_.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        return vis_, ray_
 
     def forward(self, rgb_cams, pix_T_cams, cams_T_global, vox_util, ref_T_global):
         """
@@ -109,7 +204,7 @@ class MVDet(nn.Module):
         featpix_T_cams_ = utils.geom.scale_intrinsics(pix_T_cams_, sx, sy)  # B*S,4,4
 
         featpix_T_ref_ = torch.matmul(featpix_T_cams_[:, :3, :3], cams_T_ref_[:, :3, [0, 1, 3]])  # B*S,3,3
-        ref_T_mem = vox_util.get_ref_T_mem(B, self.Y, self.Z, self.X)  # B,4,4
+        ref_T_mem = vox_util.get_ref_T_mem(B, self.Y, self.Z, self.X, device=device)  # B,4,4
         ref_T_mem = ref_T_mem[0, [0, 1, 3]][:, [0, 1, 3]]  # 3,3
         featpix_T_mem_ = torch.matmul(featpix_T_ref_, ref_T_mem)  # B*S,3,3
         mem_T_featpix = torch.inverse(featpix_T_mem_)  # B*S,3,3
@@ -122,8 +217,14 @@ class MVDet(nn.Module):
         if self.num_cameras is None:
             world_features = self.world_conv(world_features.permute(0, 2, 1, 3, 4))
             world_features = self.world_feat(world_features.sum(2, keepdim=True))
-        else:
+        elif self.view_fusion == 'none':
             world_features = self.world_feat(world_features.view(B, S * self.feat2d_dim, self.Y, self.X))
+        else:
+            with torch.no_grad():
+                vis_, ray_ = self.view_geometry(proj_mats, cams_T_ref_, ref_T_cams_, ref_T_mem, vox_util, Hf, Wf)
+            world_features, coverage, _ = self.fusion(world_features, __u(vis_), __u(ray_))
+            world_features = torch.cat([world_features.reshape(B, S * self.feat2d_dim, self.Y, self.X), coverage], 1)
+            world_features = self.world_feat(world_features)
 
         # back_proj_mats = torch.inverse(proj_mats)  # B*S,3,3
         # world_features_cam = __p(world_features.unsqueeze(1).repeat(1, S, 1, 1, 1))

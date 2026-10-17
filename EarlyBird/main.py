@@ -30,6 +30,7 @@ class WorldTrackModel(pl.LightningModule):
             max_detections=60,
             conf_threshold=0.4,
             gating_threshold=1000,
+            view_fusion='none',
     ):
         super().__init__()
         self.model_name = model_name
@@ -58,7 +59,7 @@ class WorldTrackModel(pl.LightningModule):
         # Model
         if model_name == 'mvdet':
             self.model = MVDet(self.Y, self.Z, self.X, encoder_type=self.encoder_name,
-                               num_cameras=num_cameras, num_ids=num_ids)
+                               num_cameras=num_cameras, num_ids=num_ids, view_fusion=view_fusion)
         else:
             raise ValueError(f'Unknown model name {self.model_name}')
 
