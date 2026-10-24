@@ -215,3 +215,5 @@ WorldTrack/.ipynb_checkpoints/
 # IDEs
 .idea
 .vscode
+# experiment outputs (run_experiments.py)
+experiments/

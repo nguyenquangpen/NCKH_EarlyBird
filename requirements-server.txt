@@ -1,0 +1,22 @@
+# Environment for EarlyBird/run_experiments.py on a single-GPU server (tested setup: Python 3.10, RTX 3060 12GB).
+#   python3.10 -m venv .venv && source .venv/bin/activate
+#   pip install "setuptools<70" "numpy<2"
+#   pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu118
+#   pip install -r requirements-server.txt
+setuptools<70
+numpy<2
+lightning==2.5.5
+jsonargparse[signatures]>=4.27.7
+kornia==0.6.11
+timm==0.9.2
+einops==0.6.1
+efficientnet_pytorch
+pytorch-metric-learning==2.2.0
+lap>=0.5
+motmetrics==1.4.0
+nuscenes-devkit==1.1.11
+tensorboard
+matplotlib
+opencv-python-headless
+scipy
+pytest
