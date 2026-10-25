@@ -137,9 +137,13 @@ class Run:
         self.main_py(argv, "train.log")
         self.mark("fit")
 
-    def test(self, tag, ckpt):
-        """Test ckpt; returns metrics. LightningCLI re-applies the hyper_parameters stored in --ckpt_path."""
-        self.main_py(["test", *self.common(), "-c", self.test_cfg, "--ckpt_path", ckpt], f"test_{tag}.log")
+    def test(self, tag, ckpt, conf_threshold=None):
+        """Test ckpt; returns metrics. Depending on the Lightning / torch versions, LightningCLI may re-apply the
+        hyper_parameters stored in --ckpt_path over the command line, so a threshold override must be set in both."""
+        argv = ["test", *self.common(), "-c", self.test_cfg, "--ckpt_path", ckpt]
+        if conf_threshold is not None:
+            argv += ["--model.conf_threshold", str(conf_threshold)]
+        self.main_py(argv, f"test_{tag}.log")
         os.replace(os.path.join(self.res, "test_metrics.json"), os.path.join(self.res, f"test_metrics_{tag}.json"))
         pred_dir = sorted(glob.glob(os.path.join(self.dir, "logs", "test", "version_*")), key=os.path.getmtime)[-1]
         os.makedirs(os.path.join(self.res, f"pred_{tag}"), exist_ok=True)
@@ -161,8 +165,8 @@ class Run:
         if self.done("sweep"):
             log("  sweep: đã xong, bỏ qua")
             return
-        # --model.conf_threshold alone is reset to the trained value by LightningCLI, so the threshold is
-        # written into a temporary copy of the checkpoint
+        # the threshold goes both into a temporary copy of the checkpoint and onto the command line: some
+        # LightningCLI versions reset --model.conf_threshold to the checkpoint's value, others ignore the checkpoint
         state = torch.load(os.path.join(self.ckpt_dir, "last.ckpt"), map_location="cpu", weights_only=False)
         tmp = os.path.join(self.dir, "sweep_tmp.ckpt")
         out = {}
@@ -170,7 +174,7 @@ class Run:
             t = f"{thr:.2f}"
             state["hyper_parameters"]["conf_threshold"] = thr
             torch.save(state, tmp)
-            m = self.test(f"sweep_{t}", tmp)
+            m = self.test(f"sweep_{t}", tmp, conf_threshold=thr)
             out[f"{self.arm}@{t}"] = m
             log(f"  sweep {t}: MODA {m['detect/moda']:.2f} | MOTA {m['track/mota'] * 100:.2f} | "
                 f"IDF1 {m['track/idf1'] * 100:.2f} | FP {m['track/num_false_positives']:.0f} | "
