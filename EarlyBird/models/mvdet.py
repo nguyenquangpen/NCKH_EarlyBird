@@ -165,7 +165,13 @@ class MVDet(nn.Module):
         # the ground homography also maps cells behind the camera into the image; drop them
         z_coef = torch.matmul(cams_T_ref_[:, 2:3, [0, 1, 3]], ref_T_mem)[:, 0]  # B*S,3
         depth = z_coef[:, 0, None, None] * xs + z_coef[:, 1, None, None] * ys + z_coef[:, 2, None, None]
-        vis_ = in_image & (depth > 0).unsqueeze(1)
+        # "in front" is the depth sign of most in-image cells: real cameras (Wildtrack) look along +z,
+        # MultiviewX's game-engine calibration looks along -z (visible ground has negative camera depth)
+        in_img = in_image[:, 0]
+        n_pos = (in_img & (depth > 0)).sum((1, 2))
+        n_neg = (in_img & (depth < 0)).sum((1, 2))
+        front = torch.where(n_neg > n_pos, -torch.ones_like(depth[:, 0, 0]), torch.ones_like(depth[:, 0, 0]))
+        vis_ = in_image & (depth * front[:, None, None] > 0).unsqueeze(1)
 
         mem_T_ref = vox_util.get_mem_T_ref(1, self.Y, self.Z, self.X, device=device)[0].to(dtype)  # 4,4
         cam_mem = utils.geom.apply_4x4(mem_T_ref.expand(BS, 4, 4), ref_T_cams_[:, None, :3, 3])[:, 0]  # B*S,3

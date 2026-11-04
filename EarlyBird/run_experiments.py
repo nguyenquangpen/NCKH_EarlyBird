@@ -5,9 +5,14 @@ Same protocol as earlybird-m1-kaggle.ipynb: effective batch 8 (1 GPU x accumulat
 50 epochs, test best + last, then a conf_threshold sweep on last. Each run ends with
 <out>/results_<arm>_s<seed>.zip, in the same format as the Kaggle notebook.
 
+The dataset is recognised from the name of --data_dir, as the datamodule does: a folder named Wildtrack or
+MultiviewX. MultiviewX runs are named mvx_<arm>_s<seed> so they never collide with the Wildtrack runs.
+
 Run from the EarlyBird/ package dir, ideally inside tmux / nohup:
     python run_experiments.py --data_dir /data/Wildtrack --smoke                 # 20 batches per arm, ~5 min
     python run_experiments.py --data_dir /data/Wildtrack --arms none geo m1 --seeds 42
+    python run_experiments.py --data_dir /data/MultiviewX --smoke --arms none m1
+    python run_experiments.py --data_dir /data/MultiviewX --arms none m1 --seeds 42 2024 1337
 Re-running the same command after an interruption skips finished steps and resumes training from last.ckpt.
 """
 import argparse
@@ -33,6 +38,18 @@ def log(msg):
     print(time.strftime("[%m-%d %H:%M:%S] ") + msg, flush=True)
 
 
+DATASETS = {"wildtrack": "", "multiviewx": "mvx_"}  # dataset -> run name prefix
+
+
+def dataset_of(data_dir):
+    name = os.path.basename(os.path.normpath(data_dir)).lower()
+    for d in DATASETS:
+        if d in name:
+            return d
+    raise SystemExit(f"--data_dir phải là thư mục tên 'Wildtrack' hoặc 'MultiviewX' (datamodule nhận dạng dataset "
+                     f"theo tên thư mục), nhận được: {data_dir}")
+
+
 def fmt(v, spec=".4f"):
     return format(v, spec) if v is not None else "-"
 
@@ -40,7 +57,8 @@ def fmt(v, spec=".4f"):
 class Run:
     def __init__(self, args, arm, seed, smoke=False):
         self.args, self.arm, self.seed, self.smoke = args, arm, seed, smoke
-        self.name = f"{'smoke_' if smoke else ''}{arm}_s{seed}"
+        self.dataset = dataset_of(args.data_dir)
+        self.name = f"{'smoke_' if smoke else ''}{DATASETS[self.dataset]}{arm}_s{seed}"
         self.dir = os.path.abspath(os.path.join(args.out, self.name))
         self.res = os.path.join(self.dir, "results")
         self.ckpt_dir = os.path.join(self.dir, "checkpoints")
@@ -83,7 +101,7 @@ class Run:
         json.dump(test, open(self.test_cfg, "w"), indent=2)
 
     def common(self):
-        return ["-c", "configs/d_wildtrack.yml", "-c", f"configs/m_{self.arm}.yml",
+        return ["-c", f"configs/d_{self.dataset}.yml", "-c", f"configs/m_{self.arm}.yml",
                 "--seed_everything", str(self.seed)]
 
     def done(self, step):
@@ -196,7 +214,7 @@ class Run:
         commit = subprocess.run(["git", "-C", HERE, "rev-parse", "--short", "HEAD"],
                                 capture_output=True, text=True).stdout.strip()
         h = summ["history"]
-        out = {"run": self.name, "platform": "server",
+        out = {"run": self.name, "dataset": self.dataset, "platform": "server",
                "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None, "commit": commit,
                "view_fusion": summ["view_fusion"], "fusion_params": summ["fusion_params"],
                "alpha": {t: M[t].get("alpha") for t in M}, "best_ckpt": summ["best_model_path"],
@@ -251,10 +269,17 @@ def check_env(args):
     assert torch.cuda.is_available(), "Không thấy GPU CUDA (torch.version.cuda = %s)" % torch.version.cuda
     p = torch.cuda.get_device_properties(0)
     log(f"torch {torch.__version__} (CUDA {torch.version.cuda}) | GPU 0: {p.name}, {p.total_memory / 2 ** 30:.1f} GB")
-    assert "wildtrack" in os.path.basename(os.path.normpath(args.data_dir)).lower(), \
-        "--data_dir phải là thư mục tên 'Wildtrack' (datamodule nhận dạng dataset theo tên thư mục)"
+    dataset = dataset_of(args.data_dir)
     for sub in ["Image_subsets", "annotations_positions", "calibrations"]:
         assert os.path.isdir(os.path.join(args.data_dir, sub)), f"Thiếu {args.data_dir}/{sub}"
+    # an interrupted unzip leaves a dataset that trains without error but on fewer frames
+    n_cam = {"wildtrack": 7, "multiviewx": 6}[dataset]
+    n_ann = len(glob.glob(os.path.join(args.data_dir, "annotations_positions", "*.json")))
+    cams = sorted(d for d in os.listdir(os.path.join(args.data_dir, "Image_subsets")) if d.startswith("C"))
+    n_img = {c: len(os.listdir(os.path.join(args.data_dir, "Image_subsets", c))) for c in cams}
+    log(f"dataset: {dataset} | {n_ann} file nhãn | ảnh mỗi camera: {n_img}")
+    assert n_ann == 400 and len(cams) >= n_cam and all(n_img[c] >= 400 for c in cams[:n_cam]), \
+        f"{args.data_dir} chưa đủ 400 khung hình x {n_cam} camera – giải nén lại dataset"
     commit = subprocess.run(["git", "-C", HERE, "log", "-1", "--format=%h %s"], capture_output=True, text=True)
     log(f"commit: {commit.stdout.strip()}")
 
@@ -274,18 +299,18 @@ def overview(args):
         if s["run"].startswith("smoke_"):
             continue
         m, sm = s["metrics"], s["sweep_last_mean"]
-        rows.append(f"{s['run']:<12} {m['MODA']['last']:>8.2f} {m['MOTA']['last']:>8.2f} {m['IDF1']['last']:>8.2f} "
+        rows.append(f"{s['run']:<16} {m['MODA']['last']:>8.2f} {m['MOTA']['last']:>8.2f} {m['IDF1']['last']:>8.2f} "
                     f"{sm['MODA']:>8.2f} {sm['MOTA']:>8.2f} {sm['IDF1']:>8.2f} {fmt(s['alpha']['last'], '8.3f')}")
     if rows:
-        print(f"\n{'run':<12} {'MODA':>8} {'MOTA':>8} {'IDF1':>8} {'MODA~':>8} {'MOTA~':>8} {'IDF1~':>8} {'alpha':>8}"
-              f"\n{'':<12} {'(last @0.40)':^26} {'(last, mean over thresholds)':^26}")
+        print(f"\n{'run':<16} {'MODA':>8} {'MOTA':>8} {'IDF1':>8} {'MODA~':>8} {'MOTA~':>8} {'IDF1~':>8} {'alpha':>8}"
+              f"\n{'':<16} {'(last @0.40)':^26} {'(last, mean over thresholds)':^26}")
         print("\n".join(rows))
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data_dir", required=True, help="thư mục Wildtrack (có Image_subsets, annotations_positions, "
-                                                      "calibrations)")
+    ap.add_argument("--data_dir", required=True, help="thư mục Wildtrack hoặc MultiviewX (có Image_subsets, "
+                                                      "annotations_positions, calibrations)")
     ap.add_argument("--arms", nargs="+", default=["none", "geo", "m1"], choices=["none", "geo", "m1"])
     ap.add_argument("--seeds", nargs="+", type=int, default=[42])
     ap.add_argument("--epochs", type=int, default=50)

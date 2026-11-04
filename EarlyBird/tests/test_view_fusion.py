@@ -174,6 +174,26 @@ def test_view_geometry_on_rig():
     assert (vis['ray'][0, 0, :, -1, -1] > 0).all()
 
 
+def test_view_geometry_camera_looking_along_minus_z():
+    """MultiviewX-style calibration: camera looks along -z, so visible ground has negative camera depth.
+    Flipping the camera's y/z axes and fx gives the same pixels, and must give the same visibility."""
+    num_cams = 3
+    model = make_model('geo', num_cams)
+    vis = {}
+    model.fusion.register_forward_hook(lambda m, i, o: vis.setdefault('v', []).append(i[1].clone()))
+    batch = synthetic_batch(1, num_cams)
+    flipped = dict(batch)
+    flipped['cams_T_global'] = torch.diag(torch.tensor([1., -1., -1., 1.])) @ batch['cams_T_global']
+    flipped['pix_T_cams'] = batch['pix_T_cams'].clone()
+    flipped['pix_T_cams'][..., 0, 0] *= -1
+    with torch.no_grad():
+        model(vox_util=make_vox_util(), **batch)
+        model(vox_util=make_vox_util(), **flipped)
+    v0, v1 = vis['v']
+    assert v0.any(dim=1).float().mean() > 0.5
+    assert torch.equal(v0, v1)
+
+
 def test_m1_alpha_zero_full_model_world_features_unchanged():
     num_cams = 3
     model = make_model('m1', num_cams)
