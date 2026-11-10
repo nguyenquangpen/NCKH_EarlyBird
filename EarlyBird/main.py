@@ -1,6 +1,19 @@
+import os
 import os.path as osp
 
 import torch
+
+if os.environ.get("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "0") not in ("", "0"):
+    # Lightning loads checkpoints with weights_only=True, which rejects our own checkpoints (they pickle getattr).
+    # The env var alone is only honoured by torch >= 2.4, so force full loading here for any torch version.
+    _torch_load = torch.load
+
+    def _torch_load_full(*args, **kwargs):
+        kwargs["weights_only"] = False
+        return _torch_load(*args, **kwargs)
+
+    torch.load = _torch_load_full
+
 import lightning as pl
 import matplotlib.pyplot as plt
 import numpy as np
