@@ -44,6 +44,10 @@ class WorldTrackModel(pl.LightningModule):
             conf_threshold=0.4,
             gating_threshold=1000,
             view_fusion='none',
+            fusion_heights=None,
+            track_buffer=10,
+            match_thresh=0.5,
+            motion_lambda=0.98,
     ):
         super().__init__()
         self.model_name = model_name
@@ -67,12 +71,15 @@ class WorldTrackModel(pl.LightningModule):
         self.mota_frame_gt_list, self.mota_frame_pred_list = [], []
         self.mAP_gt_dict, self.mAP_pred_dict = {}, {}
         self.mAP_results_gt, self.mAP_results_pred = {}, {}
-        self.test_tracker = JDETracker(conf_thres=self.conf_threshold, gating_threshold=gating_threshold)
+        self.test_tracker = JDETracker(conf_thres=self.conf_threshold, track_buffer=track_buffer,
+                                       gating_threshold=gating_threshold, match_thresh=match_thresh,
+                                       motion_lambda=motion_lambda)
 
         # Model
         if model_name == 'mvdet':
             self.model = MVDet(self.Y, self.Z, self.X, encoder_type=self.encoder_name,
-                               num_cameras=num_cameras, num_ids=num_ids, view_fusion=view_fusion)
+                               num_cameras=num_cameras, num_ids=num_ids, view_fusion=view_fusion,
+                               fusion_heights=fusion_heights)
         else:
             raise ValueError(f'Unknown model name {self.model_name}')
 

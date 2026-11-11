@@ -204,7 +204,7 @@ class STrack(BaseTrack):
 
 
 class JDETracker(object):
-    def __init__(self, conf_thres=0.1, track_buffer=10, gating_threshold=1000):
+    def __init__(self, conf_thres=0.1, track_buffer=10, gating_threshold=1000, match_thresh=0.5, motion_lambda=0.98):
         self.tracked_stracks: List[STrack] = []
         self.lost_stracks: List[STrack] = []
         self.removed_stracks: List[STrack] = []
@@ -213,6 +213,8 @@ class JDETracker(object):
         self.det_thresh = conf_thres
         self.gating_threshold = gating_threshold
         self.max_time_lost = track_buffer
+        self.match_thresh = match_thresh  # first association: max fused appearance/motion cost
+        self.motion_lambda = motion_lambda  # weight of the appearance cost against the Mahalanobis motion cost
 
         self.kalman_filter = KalmanFilter()
 
@@ -265,8 +267,8 @@ class JDETracker(object):
         STrack.multi_predict(strack_pool)
         dists = matching.embedding_distance(strack_pool, detections)
         dists = matching.fuse_motion(self.kalman_filter, dists, strack_pool, detections,
-                                     gating_threshold=self.gating_threshold)
-        matches, u_track, u_detection = matching.linear_assignment(dists, thresh=0.5)
+                                     lambda_=self.motion_lambda, gating_threshold=self.gating_threshold)
+        matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.match_thresh)
 
         for itracked, idet in matches:
             track = strack_pool[itracked]

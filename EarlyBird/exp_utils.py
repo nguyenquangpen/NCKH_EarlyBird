@@ -30,11 +30,11 @@ def emit(kind, **d):
 
 
 def _fusion_info(pl_module):
-    fusion = getattr(pl_module.model, "fusion", None)
-    if fusion is None:
-        return {"view_fusion": getattr(pl_module.model, "view_fusion", "none"), "alpha": None, "fusion_params": 0}
-    return {"view_fusion": fusion.mode, "alpha": _f(fusion.alpha),
-            "fusion_params": sum(p.numel() for p in fusion.parameters())}
+    model = pl_module.model
+    fusion = getattr(model, "fusion", None)
+    return {"view_fusion": getattr(model, "view_fusion", "none"),
+            "alpha": _f(fusion.alpha) if fusion is not None and fusion.mode == "m1" else None,
+            "fusion_params": sum(p.numel() for p in fusion.parameters()) if fusion is not None else 0}
 
 
 class Progress(Callback):

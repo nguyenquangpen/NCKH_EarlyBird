@@ -8,11 +8,16 @@ Same protocol as earlybird-m1-kaggle.ipynb: effective batch 8 (1 GPU x accumulat
 The dataset is recognised from the name of --data_dir, as the datamodule does: a folder named Wildtrack or
 MultiviewX. MultiviewX runs are named mvx_<arm>_s<seed> so they never collide with the Wildtrack runs.
 
+Arms (view_fusion modes, configs/m_<arm>.yml):
+    none  EarlyBird baseline              geo  geometric view weights       m1  learnt view-aware gate (M1)
+    p0    baseline + view-pooled Re-ID    m3   M1 gate + view-pooled Re-ID  m4  m3 + multi-height projection
+
 Run from the EarlyBird/ package dir, ideally inside tmux / nohup:
     python run_experiments.py --data_dir /data/Wildtrack --smoke                 # 20 batches per arm, ~5 min
     python run_experiments.py --data_dir /data/Wildtrack --arms none geo m1 --seeds 42
-    python run_experiments.py --data_dir /data/MultiviewX --smoke --arms none m1
-    python run_experiments.py --data_dir /data/MultiviewX --arms none m1 --seeds 42 2024 1337
+    python run_experiments.py --data_dir /data/MultiviewX --smoke --arms p0 m3 m4
+    python run_experiments.py --data_dir /data/MultiviewX --arms p0 m3 m4 --seeds 42        # screening round
+    python run_experiments.py --data_dir /data/MultiviewX --arms none m3 --seeds 42 2024 1337 --tracker_sweep
 Re-running the same command after an interruption skips finished steps and resumes training from last.ckpt.
 """
 import argparse
@@ -203,6 +208,44 @@ class Run:
         json.dump(out, open(os.path.join(self.res, f"sweep_{self.name}.json"), "w"), indent=2)
         self.mark("sweep")
 
+    TRACKER_GRID = {"track_buffer": [10, 20, 30], "match_thresh": [0.5, 0.6, 0.7], "motion_lambda": [0.98, 0.9]}
+
+    def tracker_sweep(self):
+        """Evaluation-only: last.ckpt at conf_threshold 0.40 over TRACKER_GRID. Defaults (10, 0.5, 0.98) are the
+        protocol used everywhere else; report any other setting as a tracker-configuration change."""
+        if self.done("tracker_sweep"):
+            log("  tracker sweep: đã xong, bỏ qua")
+            return
+        import itertools
+        state = torch.load(os.path.join(self.ckpt_dir, "last.ckpt"), map_location="cpu", weights_only=False)
+        tmp = os.path.join(self.dir, "tracker_tmp.ckpt")
+        out = {}
+        keys = list(self.TRACKER_GRID)
+        for vals in itertools.product(*self.TRACKER_GRID.values()):
+            cfg = dict(zip(keys, vals))
+            tag = "tracker_" + "_".join(f"{k.split('_')[-1]}{v}" for k, v in cfg.items())
+            state["hyper_parameters"]["conf_threshold"] = 0.40
+            state["hyper_parameters"].update(cfg)
+            torch.save(state, tmp)
+            argv = ["test", *self.common(), "-c", self.test_cfg, "--ckpt_path", tmp, "--model.conf_threshold", "0.40"]
+            for k, v in cfg.items():
+                argv += [f"--model.{k}", str(v)]
+            self.main_py(argv, f"test_{tag}.log")
+            os.replace(os.path.join(self.res, "test_metrics.json"), os.path.join(self.res, f"test_metrics_{tag}.json"))
+            m = json.load(open(os.path.join(self.res, f"test_metrics_{tag}.json")))
+            out[tag] = {**cfg, **{n: (m.get(k) or 0) * s for n, k, s in SWEEP_METRICS}}
+            log(f"  {tag}: IDF1 {out[tag]['IDF1']:.2f} | MOTA {out[tag]['MOTA']:.2f} | "
+                f"ID switches {out[tag]['ID switches']:.0f}")
+        os.remove(tmp)
+        json.dump(out, open(os.path.join(self.res, f"tracker_sweep_{self.name}.json"), "w"), indent=2)
+        print(f"\n{self.name} tracker sweep (last.ckpt @0.40), sorted by IDF1:")
+        print(f"{'buffer':>7} {'match':>6} {'lambda':>7} {'IDF1':>8} {'MOTA':>8} {'IDsw':>6} {'MODA':>8}")
+        for v in sorted(out.values(), key=lambda d: -d["IDF1"]):
+            print(f"{v['track_buffer']:>7} {v['match_thresh']:>6} {v['motion_lambda']:>7} {v['IDF1']:>8.2f} "
+                  f"{v['MOTA']:>8.2f} {v['ID switches']:>6.0f} {v['MODA']:>8.2f}")
+        shutil.make_archive(os.path.join(os.path.abspath(self.args.out), f"results_{self.name}"), "zip", self.res)
+        self.mark("tracker_sweep")
+
     def report(self):
         summ = json.load(open(os.path.join(self.res, "train_summary.json")))
         M = {t: json.load(open(os.path.join(self.res, f"test_metrics_{t}.json"))) for t in ["best", "last"]}
@@ -311,7 +354,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data_dir", required=True, help="thư mục Wildtrack hoặc MultiviewX (có Image_subsets, "
                                                       "annotations_positions, calibrations)")
-    ap.add_argument("--arms", nargs="+", default=["none", "geo", "m1"], choices=["none", "geo", "m1"])
+    ap.add_argument("--arms", nargs="+", default=["none", "geo", "m1"],
+                    choices=["none", "geo", "m1", "p0", "m3", "m4"],
+                    help="view_fusion modes (configs/m_<arm>.yml): none=EarlyBird, geo, m1=gate, "
+                         "p0=view-pooled Re-ID only, m3=gate+pooled Re-ID, m4=m3+multi-height projection")
+    ap.add_argument("--tracker_sweep", action="store_true",
+                    help="after the threshold sweep, test last.ckpt at conf 0.40 over a small grid of tracker "
+                         "settings (track_buffer x match_thresh x motion_lambda); evaluation only, no training")
     ap.add_argument("--seeds", nargs="+", type=int, default=[42])
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--thresholds", nargs="+", type=float, default=[0.40, 0.45, 0.50, 0.55, 0.60])
@@ -351,6 +400,8 @@ def main():
             r.test_best_last()
             r.sweep()
             r.report()
+            if args.tracker_sweep:
+                r.tracker_sweep()
     overview(args)
 
 

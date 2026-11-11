@@ -8,3 +8,4 @@ model:
   depth: [100, 0, 2000]
   num_cameras: 7
   num_ids: 1201
+  fusion_heights: [0, 90]  # ref z unit = cm: ground plane, body height for the view-pooled Re-ID

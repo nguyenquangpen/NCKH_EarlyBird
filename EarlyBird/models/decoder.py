@@ -92,7 +92,16 @@ class Decoder(nn.Module):
         )
         self.emb_scale = math.sqrt(2) * math.log(n_ids - 1)
 
-    def forward(self, x, feat_cams, bev_flip_indices=None):
+    def img_id_embed(self, feat_cams):
+        """image-plane Re-ID embedding (B*S,reid_feat,H,W): unit vectors scaled by emb_scale"""
+        return self.emb_scale * F.normalize(self.img_id_feat_head(feat_cams), dim=1)
+
+    def forward(self, x, feat_cams, bev_flip_indices=None, id_pool=None, img_id_feat=None):
+        """
+        id_pool: optional (B,reid_feat,Y,X) view-pooled image Re-ID embedding, added to the BEV embedding before the
+            normalisation (cells where it is 0 keep the decoder embedding)
+        img_id_feat: optional precomputed img_id_embed(feat_cams)
+        """
         b, c, h, w = x.shape
 
         # pad input
@@ -140,13 +149,16 @@ class Decoder(nn.Module):
         instance_offset_output = self.instance_offset_head(x)
         instance_size_output = self.instance_size_head(x)
         instance_rot_output = self.instance_rot_head(x)
-        instance_id_feat_output = self.emb_scale * F.normalize(self.id_feat_head(x), dim=1)
+        id_bev = self.id_feat_head(x)
+        if id_pool is not None:
+            id_bev = F.normalize(id_bev, dim=1) + F.normalize(id_pool, dim=1)
+        instance_id_feat_output = self.emb_scale * F.normalize(id_bev, dim=1)
 
         # img
         img_center_output = self.img_center_head(feat_cams)  # B*S,1,H/8,W/8
         img_offset_output = self.img_offset_head(feat_cams)  # B*S,2,H/8,W/8
         img_size_output = self.img_size_head(feat_cams)  # B*S,2,H/8,W/8
-        img_id_feat_output = self.emb_scale * F.normalize(self.img_id_feat_head(feat_cams), dim=1)  # B*S,C,H/8,W/8
+        img_id_feat_output = img_id_feat if img_id_feat is not None else self.img_id_embed(feat_cams)  # B*S,C,H/8,W/8
 
         return {
             # bev

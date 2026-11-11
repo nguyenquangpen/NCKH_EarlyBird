@@ -13,7 +13,7 @@ import torch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from models.mvdet import MVDet, ViewGatedFusion  # noqa: E402
+from models.mvdet import MVDet, ViewGatedFusion, pool_views  # noqa: E402
 from utils import vox  # noqa: E402
 
 B, S, C, Y, X = 2, 4, 8, 20, 30
@@ -51,7 +51,7 @@ def test_weights_sum_to_one_over_visible_cameras(mode):
     fusion = ViewGatedFusion(C, mode=mode)
     if mode == 'm1':
         randomise_g(fusion)
-    _, coverage, w = fusion(feats, vis, ray)
+    _, coverage, w, _ = fusion(feats, vis, ray)
 
     count = vis.sum(dim=1)  # B,1,Y,X
     total = w.sum(dim=1)
@@ -69,9 +69,9 @@ def test_weights_sum_to_one_over_visible_cameras(mode):
 def test_m1_g_changes_weights():
     feats, vis, ray = random_fusion_inputs()
     fusion = ViewGatedFusion(C, mode='m1')
-    _, _, w0 = fusion(feats, vis, ray)
+    _, _, w0, _ = fusion(feats, vis, ray)
     randomise_g(fusion)
-    _, _, w1 = fusion(feats, vis, ray)
+    _, _, w1, _ = fusion(feats, vis, ray)
     assert not torch.allclose(w0, w1)
 
 
@@ -79,8 +79,9 @@ def test_geo_gate_is_n_times_w():
     feats, vis, ray = random_fusion_inputs()
     fusion = ViewGatedFusion(C, mode='geo')
     assert len(list(fusion.parameters())) == 0
-    fused, coverage, w = fusion(feats, vis, ray)
+    fused, coverage, w, gate = fusion(feats, vis, ray)
     assert torch.allclose(fused, coverage.unsqueeze(1) * S * w * feats, atol=1e-6)
+    assert torch.allclose(gate, coverage.unsqueeze(1) * S * w, atol=1e-6)
 
 
 # ---------------------------------------------------------------- (b) alpha = 0 is the identity
@@ -89,8 +90,9 @@ def test_m1_alpha_zero_is_identity():
     fusion = ViewGatedFusion(C, mode='m1')
     randomise_g(fusion)
     assert fusion.alpha.item() == 0
-    fused, _, _ = fusion(feats, vis, ray)
+    fused, _, _, gate = fusion(feats, vis, ray)
     assert torch.equal(fused, feats)
+    assert torch.all(gate == 1)
 
 
 # ---------------------------------------------------------------- full model on a synthetic rig
@@ -98,6 +100,7 @@ MY, MZ, MX = 16, 2, 48
 BOUNDS = (0, 48, 0, 16, 0, 2)
 H, W = 64, 128
 NUM_IDS = 10
+HEIGHTS = [0.0, 0.5]  # ground plane, body height (ref z units)
 
 
 def look_at(eye, target):
@@ -135,15 +138,17 @@ def make_vox_util():
 
 def make_model(mode, num_cams=3):
     torch.manual_seed(0)
-    return MVDet(MY, MZ, MX, num_cameras=num_cams, num_ids=NUM_IDS, view_fusion=mode, device=DEVICE).eval()
+    return MVDet(MY, MZ, MX, num_cameras=num_cams, num_ids=NUM_IDS, view_fusion=mode, fusion_heights=HEIGHTS,
+                 device=DEVICE).eval()
 
 
 # ---------------------------------------------------------------- (c) shapes
-@pytest.mark.parametrize('mode', ['none', 'geo', 'm1'])
+@pytest.mark.parametrize('mode', ['none', 'geo', 'm1', 'p0', 'm3', 'm4'])
 def test_full_model_shapes(mode):
     num_cams, batch = 3, 1
     model = make_model(mode, num_cams)
-    expected_in = 128 * num_cams + (0 if mode == 'none' else 1)
+    planes = len(HEIGHTS) if mode == 'm4' else 1
+    expected_in = 128 * num_cams * planes + (0 if mode in ('none', 'p0') else 1)
     assert model.world_feat[0].in_channels == expected_in
 
     seen = {}
@@ -194,9 +199,10 @@ def test_view_geometry_camera_looking_along_minus_z():
     assert torch.equal(v0, v1)
 
 
-def test_m1_alpha_zero_full_model_world_features_unchanged():
+@pytest.mark.parametrize('mode', ['m1', 'm3', 'm4'])
+def test_m1_alpha_zero_full_model_world_features_unchanged(mode):
     num_cams = 3
-    model = make_model('m1', num_cams)
+    model = make_model(mode, num_cams)
     randomise_g(model.fusion)
     io = {}
     model.fusion.register_forward_hook(lambda m, i, o: io.update(feats=i[0], fused=o[0]))
@@ -235,3 +241,84 @@ def test_none_matches_original_code():
     for k in out_orig:
         assert torch.equal(out_new[k], out_orig[k]), k
 
+
+
+# ---------------------------------------------------------------- (d) view-pooled Re-ID and multi-height projection
+def test_pool_views_is_convex_over_visible_cameras():
+    feats, vis, ray = random_fusion_inputs()
+    _, _, w, _ = ViewGatedFusion(C, mode='geo')(feats, vis, ray)
+    pooled = pool_views(w, feats)
+    count = vis.sum(dim=1)[:, 0]  # B,Y,X
+    assert pooled.shape == (B, C, Y, X)
+    assert torch.all(pooled.permute(0, 2, 3, 1)[count == 0] == 0)
+    one = count == 1  # seen by exactly one camera: the pooled value is that camera's feature
+    single = (feats * vis.to(feats.dtype)).sum(dim=1)
+    assert torch.allclose(pooled.permute(0, 2, 3, 1)[one], single.permute(0, 2, 3, 1)[one], atol=1e-5)
+
+
+def test_plane_projection_ground_equals_baseline_and_lifted_points_move_up():
+    num_cams = 3
+    batch = synthetic_batch(1, num_cams)
+    cams_T_ref = batch['cams_T_global'][0]  # ref_T_global = I
+    K = batch['pix_T_cams'][0]
+    ref_T_mem = make_vox_util().get_ref_T_mem(1, MY, MZ, MX, device='cpu')[0, [0, 1, 3]][:, [0, 1, 3]]
+    baseline = torch.inverse(torch.matmul(torch.matmul(K[:, :3, :3], cams_T_ref[:, :3, [0, 1, 3]]), ref_T_mem))
+    P0 = MVDet.plane_projection(K, cams_T_ref, ref_T_mem, 0.0)
+    assert torch.allclose(P0, baseline, atol=1e-4)
+    Ph = MVDet.plane_projection(K, cams_T_ref, ref_T_mem, HEIGHTS[1])
+    cell = torch.tensor([MX / 2, MY / 2, 1.0])  # a BEV cell centre (mem x, y, 1)
+    for s in range(num_cams):
+        pix0 = torch.inverse(P0[s]) @ cell
+        pixh = torch.inverse(Ph[s]) @ cell
+        u0, v0 = (pix0[:2] / pix0[2]).tolist()
+        uh, vh = (pixh[:2] / pixh[2]).tolist()
+        assert vh < v0, 'a point lifted above the ground appears higher (smaller row) for a camera looking down'
+        assert abs(uh - u0) < abs(vh - v0) + 1e-3
+
+
+@pytest.mark.parametrize('mode', ['p0', 'm3', 'm4'])
+def test_pooled_reid_embedding(mode):
+    num_cams = 3
+    model = make_model(mode, num_cams)
+    io = {}
+    model.fusion.register_forward_hook(lambda m, i, o: io.update(vis=i[1], w=o[2]))
+    model.decoder.register_forward_hook(lambda m, a, kw, o: io.update(id_pool=kw['id_pool']), with_kwargs=True)
+    with torch.no_grad():
+        out = model(vox_util=make_vox_util(), **synthetic_batch(1, num_cams))
+    id_pool = io['id_pool']
+    assert id_pool.shape == (1, model.decoder.reid_feat, MY, MX)
+    unseen = ~io['vis'].any(dim=1)[:, 0]  # B,Y,X (the rig may cover the whole grid)
+    assert torch.all(id_pool.permute(0, 2, 3, 1)[unseen] == 0)
+    assert torch.all(id_pool.norm(dim=1) <= model.decoder.emb_scale + 1e-4)  # convex combination of unit vectors
+    assert torch.allclose(out['instance_id_feat'].norm(dim=1), torch.full((1, MY, MX), model.decoder.emb_scale),
+                          atol=1e-3)
+
+
+def test_p0_keeps_baseline_aggregation_without_gate_params():
+    num_cams = 3
+    model = make_model('p0', num_cams)
+    assert len(list(model.fusion.parameters())) == 0
+    assert model.world_feat[0].in_channels == 128 * num_cams
+    io = {}
+    model.fusion.register_forward_hook(lambda m, i, o: io.update(feats=i[0]))
+    model.world_feat.register_forward_hook(lambda m, i, o: io.update(wf_in=i[0]))
+    with torch.no_grad():
+        model(vox_util=make_vox_util(), **synthetic_batch(1, num_cams))
+    assert torch.equal(io['wf_in'], io['feats'].reshape(1, 128 * num_cams, MY, MX))
+
+
+def test_reid_loss_reaches_gate_weights_only_through_pooling_at_alpha_zero():
+    """With alpha = 0 the gate is the identity, so in m1 the scoring network g gets no gradient from the Re-ID
+    embedding; in m3 the view-pooled Re-ID gives it one. This is the learning signal added by m3."""
+    num_cams = 3
+    grads = {}
+    for mode in ['m1', 'm3']:
+        model = make_model(mode, num_cams).train()
+        randomise_g(model.fusion)
+        out = model(vox_util=make_vox_util(), **synthetic_batch(1, num_cams))
+        torch.manual_seed(1)
+        (out['instance_id_feat'] * torch.randn_like(out['instance_id_feat'])).sum().backward()
+        g = model.fusion.g[0].weight.grad
+        grads[mode] = 0.0 if g is None else g.abs().sum().item()
+    assert grads['m1'] == 0.0
+    assert grads['m3'] > 0.0

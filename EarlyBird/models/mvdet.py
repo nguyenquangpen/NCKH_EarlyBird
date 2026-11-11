@@ -10,7 +10,20 @@ from kornia.geometry.transform.imgwarp import warp_perspective
 from models.encoder import Encoder_res101, Encoder_res50, Encoder_res18, Encoder_eff, Encoder_swin_t, Encoder_res34
 from models.decoder import Decoder
 
-VIEW_FUSION_MODES = ('none', 'geo', 'm1')
+# view_fusion mode -> (gate, pool, multi_height)
+#   gate:  None | 'geo' | 'm1'   per-cell camera weights w_s and the gate 1 + alpha (N w_s - 1) on the BEV features
+#   pool:  None | 'geo' | 'w'    BEV Re-ID embedding += sum_s w_s * (image Re-ID embedding of camera s projected to the
+#                                 BEV cell at body height fusion_heights[1]); w from the gate module (geo or learnt)
+#   multi: bool                  project the camera features at every height in fusion_heights (not only the ground)
+MODE_SPEC = {
+    'none': (None, None, False),   # EarlyBird baseline
+    'geo': ('geo', None, False),   # geometric weights only, alpha = 1
+    'm1': ('m1', None, False),     # learnt view-aware gate
+    'p0': (None, 'geo', False),    # baseline + view-pooled Re-ID with geometric weights (ablation: pooling alone)
+    'm3': ('m1', 'w', False),      # M1 gate + view-pooled Re-ID with the M1 weights
+    'm4': ('m1', 'w', True),       # m3 + multi-height feature projection
+}
+VIEW_FUSION_MODES = tuple(MODE_SPEC)
 
 
 class ViewGatedFusion(nn.Module):
@@ -50,7 +63,7 @@ class ViewGatedFusion(nn.Module):
         feats: (B,S,C,Y,X) per-camera BEV features
         vis:   (B,S,1,Y,X) bool, camera s sees cell (y,x)
         ray:   (B,S,2,Y,X) unit vector camera -> cell in mem coordinates
-        returns gated feats (B,S,C,Y,X), N/S (B,1,Y,X), weights w (B,S,1,Y,X)
+        returns gated feats (B,S,C,Y,X), N/S (B,1,Y,X), weights w (B,S,1,Y,X), gate (B,S,1,Y,X)
         """
         B, S, C, Y, X = feats.shape
         vis_f = vis.to(feats.dtype)
@@ -69,7 +82,13 @@ class ViewGatedFusion(nn.Module):
             w = torch.softmax(logit, dim=1) * vis_f
 
         gate = 1 + self.alpha * (count * w - 1)
-        return gate * feats, count[:, 0] / S, w
+        return gate * feats, count[:, 0] / S, w, gate
+
+
+def pool_views(w, feats):
+    """Convex combination over cameras: w (B,S,1,Y,X) sums to 1 over the cameras seeing a cell (0 elsewhere),
+    feats (B,S,C,Y,X) -> (B,C,Y,X). Cells seen by no camera give 0."""
+    return (w * feats).sum(dim=1)
 
 
 class MVDet(nn.Module):
@@ -80,11 +99,19 @@ class MVDet(nn.Module):
                  latent_dim=512,
                  encoder_type='res18',
                  view_fusion='none',
-                 device=torch.device('cuda')):
+                 fusion_heights=None,
+                 device=None):
+        """
+        fusion_heights: heights above the ground plane in the ref frame's z unit (cm on Wildtrack, m on MultiviewX).
+            [0] is the ground plane used for the BEV features; [1] is the body height at which the image Re-ID
+            embeddings are sampled for the view-pooled Re-ID ('p0', 'm3', 'm4'); 'm4' projects the features at all.
+        """
         super().__init__()
         assert (encoder_type in ['res101', 'res50', 'res18', 'res34', 'effb0', 'effb4', 'swin_t'])
         assert view_fusion in VIEW_FUSION_MODES, f'view_fusion must be one of {VIEW_FUSION_MODES}'
         assert view_fusion == 'none' or num_cameras is not None, 'view_fusion requires num_cameras'
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         self.Y, self.Z, self.X = Y, Z, X
         self.rand_flip = rand_flip
@@ -92,6 +119,12 @@ class MVDet(nn.Module):
         self.encoder_type = encoder_type
         self.num_cameras = num_cameras
         self.view_fusion = view_fusion
+        self.gate_mode, self.pool_mode, self.multi_height = MODE_SPEC[view_fusion]
+        self.heights = [float(h) for h in (fusion_heights if fusion_heights is not None else [0.0])]
+        assert self.heights[0] == 0.0, 'fusion_heights[0] must be the ground plane (0)'
+        if self.pool_mode is not None:
+            assert len(self.heights) >= 2, f'view_fusion={view_fusion} needs fusion_heights=[0, body_height]'
+            assert not rand_flip, 'view-pooled Re-ID is not implemented together with rand_flip'
 
         self.mean = torch.as_tensor([0.485, 0.456, 0.406], device=device).reshape(1, 3, 1, 1)
         self.std = torch.as_tensor([0.229, 0.224, 0.225], device=device).reshape(1, 3, 1, 1)
@@ -120,12 +153,14 @@ class MVDet(nn.Module):
                 # nn.Conv3d(latent_dim, latent_dim, 3, padding=(1, 2, 2), dilation=(1, 2, 2)),
             )
         else:
-            # geo / m1 append one N/S coverage channel
-            extra_ch = 0 if view_fusion == 'none' else 1
-            if view_fusion != 'none':
-                self.fusion = ViewGatedFusion(self.feat2d_dim, mode=view_fusion)
+            # gated modes append one N/S coverage channel; multi-height stacks one feature block per height
+            extra_ch = 1 if self.gate_mode is not None else 0
+            n_planes = len(self.heights) if self.multi_height else 1
+            if self.gate_mode is not None or self.pool_mode is not None:
+                self.fusion = ViewGatedFusion(self.feat2d_dim, mode=self.gate_mode or 'geo')
             self.world_feat = nn.Sequential(
-                nn.Conv2d(self.feat2d_dim * self.num_cameras + extra_ch, latent_dim, kernel_size=3, padding=1),
+                nn.Conv2d(self.feat2d_dim * self.num_cameras * n_planes + extra_ch, latent_dim, kernel_size=3,
+                          padding=1),
                 nn.InstanceNorm3d(latent_dim), nn.ReLU(),
                 nn.Conv2d(latent_dim, latent_dim, kernel_size=1),
             )
@@ -179,6 +214,18 @@ class MVDet(nn.Module):
         ray_ = ray_ / ray_.norm(dim=1, keepdim=True).clamp_min(1e-6)
         return vis_, ray_
 
+    @staticmethod
+    def plane_projection(featpix_T_cams_, cams_T_ref_, ref_T_mem, h=0.0):
+        """
+        mem_T_featpix (B*S,3,3): homography from feature pixels to BEV cells for the plane z = h of the ref frame.
+        A ref point (x, y, h) maps to camera coordinates with columns 0, 1 of cams_T_ref plus h * column 2 + column 3,
+        so h = 0 is the ground-plane homography of the baseline.
+        """
+        cols = cams_T_ref_[:, :3, [0, 1, 3]].clone()
+        cols[:, :, 2] = cols[:, :, 2] + h * cams_T_ref_[:, :3, 2]
+        featpix_T_ref_ = torch.matmul(featpix_T_cams_[:, :3, :3], cols)  # B*S,3,3
+        return torch.inverse(torch.matmul(featpix_T_ref_, ref_T_mem))
+
     def forward(self, rgb_cams, pix_T_cams, cams_T_global, vox_util, ref_T_global):
         """
         B = batch size, S = number of cameras, C = 3, H = img height, W = img width
@@ -209,17 +256,18 @@ class MVDet(nn.Module):
         sx = Wf / float(W)
         featpix_T_cams_ = utils.geom.scale_intrinsics(pix_T_cams_, sx, sy)  # B*S,4,4
 
-        featpix_T_ref_ = torch.matmul(featpix_T_cams_[:, :3, :3], cams_T_ref_[:, :3, [0, 1, 3]])  # B*S,3,3
         ref_T_mem = vox_util.get_ref_T_mem(B, self.Y, self.Z, self.X, device=device)  # B,4,4
         ref_T_mem = ref_T_mem[0, [0, 1, 3]][:, [0, 1, 3]]  # 3,3
-        featpix_T_mem_ = torch.matmul(featpix_T_ref_, ref_T_mem)  # B*S,3,3
-        mem_T_featpix = torch.inverse(featpix_T_mem_)  # B*S,3,3
-        proj_mats = mem_T_featpix  # B*S,3,3
+        # feature pixels -> BEV cells for every plane z = h of the ref frame; index 0 is the ground plane
+        proj_mats_h = [self.plane_projection(featpix_T_cams_, cams_T_ref_, ref_T_mem, h) for h in self.heights]
+        proj_mats = proj_mats_h[0]  # B*S,3,3
 
-        # B*S,latent_dim,Y,X
-        world_features_ = warp_perspective(feat_cams_, proj_mats, (self.Y, self.X), align_corners=False)
+        planes = proj_mats_h if self.multi_height else proj_mats_h[:1]
+        # one B*S,latent_dim,Y,X block per projected plane
+        world_features_ = [warp_perspective(feat_cams_, P, (self.Y, self.X), align_corners=False) for P in planes]
+        world_features = __u(world_features_[0])  # B,S,latent_dim,Y,X (ground plane)
 
-        world_features = __u(world_features_)  # B,S,latent_dim,Y,X
+        id_pool, img_id_feat_ = None, None
         if self.num_cameras is None:
             world_features = self.world_conv(world_features.permute(0, 2, 1, 3, 4))
             world_features = self.world_feat(world_features.sum(2, keepdim=True))
@@ -228,9 +276,20 @@ class MVDet(nn.Module):
         else:
             with torch.no_grad():
                 vis_, ray_ = self.view_geometry(proj_mats, cams_T_ref_, ref_T_cams_, ref_T_mem, vox_util, Hf, Wf)
-            world_features, coverage, _ = self.fusion(world_features, __u(vis_), __u(ray_))
-            world_features = torch.cat([world_features.reshape(B, S * self.feat2d_dim, self.Y, self.X), coverage], 1)
-            world_features = self.world_feat(world_features)
+            gated, coverage, w, gate = self.fusion(world_features, __u(vis_), __u(ray_))
+            if self.pool_mode is not None:
+                # image Re-ID embeddings sampled where a person standing on the cell has its body (heights[1]),
+                # pooled over the cameras with the view weights; the Re-ID losses train w through this path
+                img_id_feat_ = self.decoder.img_id_embed(feat_cams_)  # B*S,reid_feat,Hf,Wf
+                id_proj = warp_perspective(img_id_feat_, proj_mats_h[1], (self.Y, self.X), align_corners=False)
+                id_pool = pool_views(w, __u(id_proj))  # B,reid_feat,Y,X
+            if self.gate_mode is None:  # 'p0': the baseline aggregation, the weights only pool the Re-ID
+                world_features = self.world_feat(world_features.reshape(B, S * self.feat2d_dim, self.Y, self.X))
+            else:
+                blocks = [gated] + [gate * __u(f) for f in world_features_[1:]]  # the same gate on every plane
+                world_features = torch.cat([b.reshape(B, S * self.feat2d_dim, self.Y, self.X) for b in blocks]
+                                           + [coverage], 1)
+                world_features = self.world_feat(world_features)
 
         # back_proj_mats = torch.inverse(proj_mats)  # B*S,3,3
         # world_features_cam = __p(world_features.unsqueeze(1).repeat(1, S, 1, 1, 1))
@@ -238,6 +297,7 @@ class MVDet(nn.Module):
         # feat_cams_ = feat_cams_ + self.cam_out(feat_cams_back_)
 
         out_dict = self.decoder(world_features, feat_cams_,
-                                (self.bev_flip1_index, self.bev_flip2_index) if self.rand_flip else None)
+                                (self.bev_flip1_index, self.bev_flip2_index) if self.rand_flip else None,
+                                id_pool=id_pool, img_id_feat=img_id_feat_)
 
         return out_dict

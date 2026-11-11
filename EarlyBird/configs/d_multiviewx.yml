@@ -9,3 +9,4 @@ model:
   num_cameras: 6
   num_ids: 350  # id: 0~349
   gating_threshold: 30000
+  fusion_heights: [0, 0.9]  # ref z unit = m: ground plane, body height for the view-pooled Re-ID
