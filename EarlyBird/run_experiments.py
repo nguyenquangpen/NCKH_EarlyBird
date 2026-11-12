@@ -11,6 +11,7 @@ MultiviewX. MultiviewX runs are named mvx_<arm>_s<seed> so they never collide wi
 Arms (view_fusion modes, configs/m_<arm>.yml):
     none  EarlyBird baseline              geo  geometric view weights       m1  learnt view-aware gate (M1)
     p0    baseline + view-pooled Re-ID    m3   M1 gate + view-pooled Re-ID  m4  m3 + multi-height projection
+    h2    baseline + multi-height projection (ablation of m4)
 
 Run from the EarlyBird/ package dir, ideally inside tmux / nohup:
     python run_experiments.py --data_dir /data/Wildtrack --smoke                 # 20 batches per arm, ~5 min
@@ -355,7 +356,7 @@ def main():
     ap.add_argument("--data_dir", required=True, help="thư mục Wildtrack hoặc MultiviewX (có Image_subsets, "
                                                       "annotations_positions, calibrations)")
     ap.add_argument("--arms", nargs="+", default=["none", "geo", "m1"],
-                    choices=["none", "geo", "m1", "p0", "m3", "m4"],
+                    choices=["none", "geo", "m1", "p0", "m3", "m4", "h2"],
                     help="view_fusion modes (configs/m_<arm>.yml): none=EarlyBird, geo, m1=gate, "
                          "p0=view-pooled Re-ID only, m3=gate+pooled Re-ID, m4=m3+multi-height projection")
     ap.add_argument("--tracker_sweep", action="store_true",

@@ -22,6 +22,7 @@ MODE_SPEC = {
     'p0': (None, 'geo', False),    # baseline + view-pooled Re-ID with geometric weights (ablation: pooling alone)
     'm3': ('m1', 'w', False),      # M1 gate + view-pooled Re-ID with the M1 weights
     'm4': ('m1', 'w', True),       # m3 + multi-height feature projection
+    'h2': (None, None, True),      # baseline + multi-height feature projection only (ablation of m4: no gate/pooling)
 }
 VIEW_FUSION_MODES = tuple(MODE_SPEC)
 
@@ -273,6 +274,9 @@ class MVDet(nn.Module):
             world_features = self.world_feat(world_features.sum(2, keepdim=True))
         elif self.view_fusion == 'none':
             world_features = self.world_feat(world_features.view(B, S * self.feat2d_dim, self.Y, self.X))
+        elif self.gate_mode is None and self.pool_mode is None:  # 'h2': stacked planes, no view weights
+            world_features = self.world_feat(torch.cat(
+                [__u(f).reshape(B, S * self.feat2d_dim, self.Y, self.X) for f in world_features_], 1))
         else:
             with torch.no_grad():
                 vis_, ray_ = self.view_geometry(proj_mats, cams_T_ref_, ref_T_cams_, ref_T_mem, vox_util, Hf, Wf)

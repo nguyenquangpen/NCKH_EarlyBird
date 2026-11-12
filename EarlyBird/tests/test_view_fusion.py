@@ -143,12 +143,12 @@ def make_model(mode, num_cams=3):
 
 
 # ---------------------------------------------------------------- (c) shapes
-@pytest.mark.parametrize('mode', ['none', 'geo', 'm1', 'p0', 'm3', 'm4'])
+@pytest.mark.parametrize('mode', ['none', 'geo', 'm1', 'p0', 'm3', 'm4', 'h2'])
 def test_full_model_shapes(mode):
     num_cams, batch = 3, 1
     model = make_model(mode, num_cams)
-    planes = len(HEIGHTS) if mode == 'm4' else 1
-    expected_in = 128 * num_cams * planes + (0 if mode in ('none', 'p0') else 1)
+    planes = len(HEIGHTS) if mode in ('m4', 'h2') else 1
+    expected_in = 128 * num_cams * planes + (0 if mode in ('none', 'p0', 'h2') else 1)
     assert model.world_feat[0].in_channels == expected_in
 
     seen = {}
@@ -322,3 +322,18 @@ def test_reid_loss_reaches_gate_weights_only_through_pooling_at_alpha_zero():
         grads[mode] = 0.0 if g is None else g.abs().sum().item()
     assert grads['m1'] == 0.0
     assert grads['m3'] > 0.0
+
+
+def test_h2_ground_block_equals_baseline_projection():
+    """h2 = baseline with an extra plane: the first S*128 input channels of the aggregation are the baseline's."""
+    num_cams = 3
+    io = {}
+    for mode in ['none', 'h2']:
+        model = make_model(mode, num_cams)
+        assert not hasattr(model, 'fusion')
+        model.world_feat.register_forward_hook(lambda m, i, o, mode=mode: io.update({mode: i[0]}))
+        with torch.no_grad():
+            model(vox_util=make_vox_util(), **synthetic_batch(1, num_cams))
+    assert io['h2'].shape[1] == 2 * io['none'].shape[1]
+    assert torch.equal(io['h2'][:, :128 * num_cams], io['none'])
+    assert not torch.equal(io['h2'][:, 128 * num_cams:], io['none'])
